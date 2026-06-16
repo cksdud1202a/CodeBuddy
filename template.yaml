@@ -1,0 +1,168 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CodeBuddy Agent - GitHub PR 자동 리뷰 시스템
+
+Parameters:
+  GitHubToken:
+    Type: String
+    NoEcho: true
+    Description: GitHub Personal Access Token
+
+  AgentId:
+    Type: String
+    Description: Bedrock Agent ID
+
+  AliasId:
+    Type: String
+    Description: Bedrock Agent Alias ID
+
+Resources:
+  # Lambda 실행 역할
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CodeBuddy-Lambda-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # GitHub PR 조회 Lambda
+  GitHubPRLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: codebuddy-github-pr
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          GITHUB_TOKEN: !Ref GitHubToken
+      Code:
+        ZipFile: |
+          import json, os, logging
+          from github import Github, GithubException
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def handler(event, context):
+              try:
+                  params = {p["name"]: p["value"] for p in event.get("parameters", [])}
+                  owner, repo_name, pr_number = params.get("owner"), params.get("repo"), params.get("pr_number")
+                  if not all([owner, repo_name, pr_number]):
+                      raise ValueError("Missing required parameters")
+
+                  g = Github(os.environ["GITHUB_TOKEN"])
+                  repo = g.get_repo(f"{owner}/{repo_name}")
+                  pr = repo.get_pull(int(pr_number))
+
+                  files = pr.get_files()
+                  diff_content = [{"filename": f.filename, "patch": f.patch or "", "additions": f.additions, "deletions": f.deletions} for f in files]
+
+                  return build_response(event, 200, {
+                      "title": pr.title, "body": pr.body or "", "state": pr.state,
+                      "author": pr.user.login, "created_at": pr.created_at.isoformat(),
+                      "changed_files": pr.changed_files, "additions": pr.additions,
+                      "deletions": pr.deletions, "diff": diff_content
+                  })
+              except GithubException as e:
+                  return build_response(event, 404, {"error": str(e)})
+              except Exception as e:
+                  return build_response(event, 500, {"error": str(e)})
+
+          def build_response(event, status, body):
+              return {"messageVersion": "1.0", "response": {
+                  "actionGroup": event.get("actionGroup"),
+                  "apiPath": event.get("apiPath"),
+                  "httpMethod": event.get("httpMethod"),
+                  "httpStatusCode": status,
+                  "responseBody": {"application/json": {"body": body}}}}
+
+  # GitHub 저장소 목록 조회 Lambda
+  ListReposLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: codebuddy-list-repos
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          GITHUB_TOKEN: !Ref GitHubToken
+      Code:
+        ZipFile: |
+          import json, os, logging
+          from github import Github, GithubException
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def handler(event, context):
+              try:
+                  params = {p["name"]: p["value"] for p in event.get("parameters", [])}
+                  owner = params.get("owner")
+                  repo_type = params.get("type", "all")
+                  if not owner:
+                      raise ValueError("Missing required parameter: owner")
+
+                  g = Github(os.environ["GITHUB_TOKEN"])
+                  try:
+                      user = g.get_user(owner)
+                  except GithubException:
+                      user = g.get_organization(owner)
+
+                  repos = [{"name": r.name, "full_name": r.full_name, "description": r.description,
+                            "html_url": r.html_url, "private": r.private, "fork": r.fork, "language": r.language}
+                           for r in user.get_repos(type=repo_type)]
+
+                  return build_response(event, 200, repos)
+              except GithubException as e:
+                  return build_response(event, 404, {"error": str(e)})
+              except Exception as e:
+                  return build_response(event, 500, {"error": str(e)})
+
+          def build_response(event, status, body):
+              return {"messageVersion": "1.0", "response": {
+                  "actionGroup": event.get("actionGroup"),
+                  "apiPath": event.get("apiPath"),
+                  "httpMethod": event.get("httpMethod"),
+                  "httpStatusCode": status,
+                  "responseBody": {"application/json": {"body": body}}}}
+
+  # Bedrock Agent → Lambda 호출 권한 (PR)
+  LambdaPRPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt GitHubPRLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: bedrock.amazonaws.com
+      SourceArn: !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:agent/${AgentId}
+
+  # Bedrock Agent → Lambda 호출 권한 (Repos)
+  LambdaReposPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ListReposLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: bedrock.amazonaws.com
+      SourceArn: !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:agent/${AgentId}
+
+Outputs:
+  GitHubPRLambdaArn:
+    Description: GitHub PR Lambda ARN
+    Value: !GetAtt GitHubPRLambda.Arn
+
+  ListReposLambdaArn:
+    Description: List Repos Lambda ARN
+    Value: !GetAtt ListReposLambda.Arn
+
+  LambdaRoleArn:
+    Description: Lambda Execution Role ARN
+    Value: !GetAtt LambdaExecutionRole.Arn
